@@ -1,0 +1,73 @@
+services:
+  mlflow-server:
+    image: ghcr.io/mlflow/mlflow:v3.17.0
+    container_name: mlflow-server
+    restart: unless-stopped
+    ports:
+      - "5001:5000"
+    volumes:
+      - mlflow-data:/mlflow
+    environment:
+      - MLFLOW_TRACKING_URI=sqlite:////mlflow/mlflow.db
+    command:
+      - sh
+      - -c
+      - |
+        python -c "
+        import mlflow
+        client = mlflow.tracking.MlflowClient('sqlite:////mlflow/mlflow.db')
+        if not client.get_experiment_by_name('otel-trace-storage'):
+            exp_id = client.create_experiment('otel-trace-storage')
+            print(f'Created experiment otel-trace-storage with ID {exp_id}')
+        else:
+            print('Experiment otel-trace-storage already exists')
+        "
+        exec mlflow server --backend-store-uri sqlite:////mlflow/mlflow.db --default-artifact-root /mlflow/artifacts --host 0.0.0.0 --port 5000 --allowed-hosts "*"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    container_name: otel-collector
+    restart: unless-stopped
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otelcol-contrib/config.yaml:ro
+    ports:
+      - "4317:4317"   # OTLP gRPC receiver
+      - "4318:4318"   # OTLP HTTP receiver
+      - "13133:13133" # health_check extension
+    depends_on:
+      mlflow-server:
+        condition: service_healthy
+
+  sample-app:
+    build:
+      context: ./app
+      dockerfile: Dockerfile
+    container_name: sample-app
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - OTEL_SERVICE_NAME=sample-fastapi-service
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317
+      - OTEL_EXPORTER_OTLP_INSECURE=true
+    depends_on:
+      mlflow-server:
+        condition: service_healthy
+      otel-collector:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+volumes:
+  mlflow-data:
